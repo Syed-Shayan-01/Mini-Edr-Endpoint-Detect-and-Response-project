@@ -1,0 +1,9 @@
+# Mini-EDR (Behavior-Based Ransomware Detector) - Python Dependencies
+# Install all required libraries in one command:
+#     pip install -r requirements.txt
+
+streamlit>=1.37.0
+watchdog>=4.0.0
+psutil>=5.9.8
+pandas>=2.0.0
+plotly>=5.18.0

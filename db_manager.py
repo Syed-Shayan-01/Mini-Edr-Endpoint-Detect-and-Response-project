@@ -1,5 +1,18 @@
-import sqlite3
 import os
+import sys
+
+# Ensure Conda DLLs (like sqlite3.dll) are found when elevated via UAC
+_conda_bin = os.path.join(sys.prefix, "Library", "bin")
+if os.path.isdir(_conda_bin):
+    os.environ["PATH"] = _conda_bin + os.pathsep + os.environ.get("PATH", "")
+    if hasattr(os, "add_dll_directory"):
+        try:
+            os.add_dll_directory(_conda_bin)
+        except Exception:
+            pass
+
+import json
+import sqlite3
 import time
 import threading
 import logging
@@ -11,7 +24,8 @@ logging.getLogger("asyncio").setLevel(logging.CRITICAL)
 
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 DB_PATH = os.path.join(BASE_DIR, "mini_edr.db")
-VAULT_DIR = os.path.join(BASE_DIR, "MiniEDR_Vault")
+DEFAULT_SANDBOX = os.path.join(BASE_DIR, "Demo_Protected_Folder")
+VAULT_DIR = os.path.join(BASE_DIR, "MiniEDR_Backup_Vault")
 
 _local = threading.local()
 _write_lock = threading.Lock()
@@ -23,10 +37,7 @@ def _is_lock_error(e):
 
 
 def _create_connection():
-    """
-    Creates an SQLite connection in native Autocommit mode (isolation_level=None)
-    so Python never holds an implicit transaction lock open across calls.
-    """
+    """Creates an SQLite connection in autocommit mode so locks are never held open."""
     conn = sqlite3.connect(
         DB_PATH,
         timeout=60.0,
@@ -39,9 +50,6 @@ def _create_connection():
 
 
 def get_conn():
-    """
-    Legacy helper. Prefer read_df() for dashboard reads (no leaked connections).
-    """
     old_conn = getattr(_local, "conn", None)
     if old_conn is not None:
         try:
@@ -53,10 +61,7 @@ def get_conn():
 
 
 def read_df(query, params=()):
-    """
-    Runs a SELECT in a short-lived connection and always closes it.
-    Returns an empty DataFrame on any failure so the UI never crashes.
-    """
+    """Runs a SELECT query in a short-lived connection and always closes it."""
     conn = None
     try:
         conn = _create_connection()
@@ -73,10 +78,7 @@ def read_df(query, params=()):
 
 
 def execute_write(query, params=(), many=False):
-    """
-    Executes write operations in a short-lived, self-closing connection with
-    automatic rollback on failure so the database can never stay locked.
-    """
+    """Runs a write query with retry and rollback so the database never stays locked."""
     with _write_lock:
         for attempt in range(6):
             conn = None
@@ -124,13 +126,12 @@ def init_db():
             conn.execute("PRAGMA journal_mode=WAL;")
             c = conn.cursor()
 
-            # Auto-migrate alerts table if missing 'disposition'
+            # Auto-migrate old tables if needed
             c.execute("PRAGMA table_info(alerts)")
             a_cols = [row[1] for row in c.fetchall()]
             if a_cols and "disposition" not in a_cols:
                 c.execute("DROP TABLE IF EXISTS alerts")
 
-            # Auto-migrate vault_metadata table if missing 'orig_size' or 'comp_size'
             c.execute("PRAGMA table_info(vault_metadata)")
             v_cols = [row[1] for row in c.fetchall()]
             if v_cols and ("orig_size" not in v_cols or "comp_size" not in v_cols):
@@ -205,15 +206,17 @@ def init_db():
                 ("engine_cpu", "0.0"),
                 ("engine_ram_mb", "0.0"),
                 ("engine_pid", "0"),
+                ("engine_is_admin", "0"),
                 ("engine_heartbeat", "0"),
                 ("dashboard_pid", "0"),
                 ("engine_launching_until", "0"),
                 ("last_unrecovered", ""),
                 ("engine_busy", "0"),
-                ("vss_status", "Level 2 Compressed Vault Active"),
-                ("vss_last_test", "Never Run")
+                ("tier1_vss_enabled", "1"),
+                ("tier2_vault_enabled", "1"),
+                ("protected_folders", json.dumps([DEFAULT_SANDBOX])),
+                ("vss_status", "Tier-2 Compressed Vault Active"),
             ]
-            # Autocommit mode: a single executemany is enough (no BEGIN IMMEDIATE needed)
             c.executemany("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", defaults)
             return
         except sqlite3.OperationalError as e:
@@ -254,6 +257,38 @@ def set_setting(key, value):
 def set_settings_batch(settings_dict):
     data = [(k, str(v)) for k, v in settings_dict.items()]
     execute_write("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", data, many=True)
+
+
+def get_protected_folders():
+    """Returns the normalized list of folders monitored by the EDR engine."""
+    raw = get_setting("protected_folders", "")
+    try:
+        folders = json.loads(raw) if raw else [DEFAULT_SANDBOX]
+    except Exception:
+        folders = [DEFAULT_SANDBOX]
+    clean = []
+    seen = set()
+    for f in folders:
+        p = os.path.abspath(str(f).strip())
+        key = os.path.normcase(p)
+        if p and key not in seen and key != os.path.normcase(VAULT_DIR):
+            seen.add(key)
+            clean.append(p)
+    return clean if clean else [DEFAULT_SANDBOX]
+
+
+def set_protected_folders(folder_list):
+    clean = []
+    seen = set()
+    for f in folder_list:
+        p = os.path.abspath(str(f).strip())
+        key = os.path.normcase(p)
+        if p and key not in seen and key != os.path.normcase(VAULT_DIR):
+            seen.add(key)
+            clean.append(p)
+    if not clean:
+        clean = [DEFAULT_SANDBOX]
+    set_setting("protected_folders", json.dumps(clean))
 
 
 def log_events_batch(events_list):
@@ -308,6 +343,31 @@ def upsert_vault_meta(file_path, entropy, header_bytes, sha256_hash, orig_size=0
 
 def delete_vault_meta(file_path):
     execute_write("DELETE FROM vault_metadata WHERE file_path=?", (os.path.abspath(file_path),))
+
+
+def clear_missing_vault_meta(valid_folders):
+    """Removes metadata entries for folders that are no longer monitored."""
+    norm_folders = [os.path.normcase(os.path.abspath(f)) for f in valid_folders]
+    conn = None
+    to_remove = []
+    try:
+        conn = _create_connection()
+        c = conn.cursor()
+        c.execute("SELECT file_path FROM vault_metadata")
+        for (fp,) in c.fetchall():
+            fp_norm = os.path.normcase(os.path.abspath(fp))
+            if not any(fp_norm.startswith(nf) for nf in norm_folders):
+                to_remove.append((fp,))
+    except Exception:
+        return
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    if to_remove:
+        execute_write("DELETE FROM vault_metadata WHERE file_path=?", to_remove, many=True)
 
 
 def get_all_vault_meta():

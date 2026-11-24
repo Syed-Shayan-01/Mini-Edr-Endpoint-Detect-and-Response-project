@@ -19,7 +19,8 @@ from edr_engine import (
     LOG_FILE,
     TRAP_FOLDER_NAME,
     get_sha256,
-    calculate_entropy
+    calculate_entropy,
+    is_file_compromised
 )
 
 st.set_page_config(
@@ -30,18 +31,17 @@ st.set_page_config(
 
 
 def safe_render(fn):
-    """Keeps a live fragment from crashing the whole page on a transient error."""
+    """Keeps a live fragment from crashing the page on a transient error."""
     @functools.wraps(fn)
     def wrapper(*a, **k):
         try:
             return fn(*a, **k)
-        except Exception as e:  # st.rerun()/stop are BaseException, so they pass through
+        except Exception as e:
             logging.error(f"{fn.__name__} render error: {e}")
             st.warning(f"Live view refreshing ({type(e).__name__})...")
     return wrapper
 
 
-# Initialize DB only once per Streamlit server process (not on every rerun)
 @st.cache_resource
 def _boot_once():
     db.init_db()
@@ -50,7 +50,6 @@ def _boot_once():
 
 _boot_once()
 
-# Register current dashboard PID so the Engine never touches it
 if db.get_setting("dashboard_pid") != str(os.getpid()):
     db.set_setting("dashboard_pid", str(os.getpid()))
 
@@ -64,11 +63,6 @@ def get_engine_state():
 
 
 def start_background_engine(as_admin=False, force=False):
-    """
-    Starts the sensor without blocking the UI (no long sleeps).
-    A 'launching' lock prevents Streamlit reruns from spawning duplicate engines.
-    force=True is used by explicit user button clicks.
-    """
     alive, old_pid, old_admin = get_engine_state()
     engine_script = os.path.join(BASE_DIR, "edr_engine.py")
     launching_until = float(db.get_setting("engine_launching_until", "0") or 0)
@@ -82,7 +76,6 @@ def start_background_engine(as_admin=False, force=False):
             while time.time() - t0 < 6 and psutil.pid_exists(old_pid):
                 time.sleep(0.2)
         db.set_setting("engine_launching_until", str(time.time() + 60))
-        # Triggers Windows UAC Prompt ("Run as Administrator") to enable Tier-1 VSS
         ctypes.windll.shell32.ShellExecuteW(
             None, "runas", sys.executable, f'"{engine_script}"', BASE_DIR, 0
         )
@@ -95,24 +88,13 @@ def start_background_engine(as_admin=False, force=False):
     return get_engine_state()
 
 
-# Auto-start the sensor only once per browser session
 if "engine_boot_done" not in st.session_state:
     st.session_state.engine_boot_done = True
     start_background_engine(as_admin=False)
 
-# ---------------- THEME SWITCHER STATE ---------------- #
+# ---------------- THEME STATE ---------------- #
 if "ui_theme" not in st.session_state:
     st.session_state.ui_theme = "Blue & White (Light)"
-
-top_bar_col1, top_bar_col2 = st.columns([4, 1])
-with top_bar_col2:
-    selected_theme = st.selectbox(
-        "Console Theme Mode",
-        ["Blue & White (Light)", "Cyber Navy (Dark)"],
-        index=0 if st.session_state.ui_theme == "Blue & White (Light)" else 1,
-        label_visibility="collapsed"
-    )
-    st.session_state.ui_theme = selected_theme
 
 is_dark = st.session_state.ui_theme == "Cyber Navy (Dark)"
 
@@ -158,7 +140,7 @@ else:
     PLOTLY_TEMPLATE = "plotly_white"
 
 
-# ---------------- DUAL-THEME COMPLETE CSS OVERRIDE ---------------- #
+# ---------------- DUAL-THEME CSS (FIXED TOP PADDING & FULL-WIDTH HEADER) ---------------- #
 st.markdown(f"""
 <style>
     :root {{
@@ -176,10 +158,13 @@ st.markdown(f"""
         color: var(--text-primary) !important;
         font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, sans-serif !important;
     }}
+    /* Proper top padding so Streamlit's Stop/Deploy toolbar never clips our header */
     .block-container {{
-        padding-top: 0.6rem !important;
+        padding-top: 3.4rem !important;
         padding-bottom: 2.5rem !important;
-        max-width: 98% !important;
+        padding-left: 1.5rem !important;
+        padding-right: 1.5rem !important;
+        max-width: 100% !important;
     }}
     div[data-testid="stMarkdownContainer"] p,
     div[data-testid="stMarkdownContainer"] li,
@@ -231,12 +216,12 @@ st.markdown(f"""
     div[data-testid="stFormSubmitButton"] > button {{
         border-radius: 5px !important;
         font-weight: 600 !important;
-        font-size: 0.8rem !important;
-        letter-spacing: 0.03em !important;
+        font-size: 0.78rem !important;
+        letter-spacing: 0.02em !important;
         border: 1px solid var(--border-color) !important;
         background-color: var(--bg-card) !important;
         color: var(--text-primary) !important;
-        padding: 0.45rem 0.9rem !important;
+        padding: 0.45rem 0.75rem !important;
         min-height: 38px !important;
     }}
     div.stButton > button p,
@@ -292,25 +277,31 @@ st.markdown(f"""
     button[data-baseweb="tab"][aria-selected="true"] p {{
         color: var(--accent-blue) !important;
     }}
+    /* Full-width responsive top header bar */
     .edr-navbar {{
+        width: 100%;
+        box-sizing: border-box;
         background: linear-gradient(90deg, #0a2540 0%, #0043a4 60%, #0052cc 100%);
         color: #ffffff !important;
-        padding: 16px 24px;
+        padding: 18px 26px;
         border-radius: 8px;
         box-shadow: 0 4px 14px rgba(0, 82, 204, 0.16);
         display: flex;
         justify-content: space-between;
         align-items: center;
+        flex-wrap: wrap;
+        gap: 12px;
         margin-bottom: 14px;
         border-bottom: 3px solid #38bdf8;
     }}
     .edr-brand-title {{
-        font-size: 1.3rem;
+        font-size: 1.32rem;
         font-weight: 700;
         letter-spacing: 0.03em;
         color: #ffffff !important;
         text-transform: uppercase;
         margin: 0;
+        line-height: 1.3;
     }}
     .edr-brand-sub {{
         font-size: 0.78rem;
@@ -328,6 +319,7 @@ st.markdown(f"""
         padding: 8px 14px;
         border-radius: 6px;
         border: 1px solid rgba(255, 255, 255, 0.22);
+        white-space: nowrap;
     }}
     .edr-banner-secure {{
         background-color: {BANNER_SEC_BG};
@@ -429,6 +421,7 @@ st.markdown(f"""
         padding: 10px 14px;
         border-bottom: 2px solid var(--border-color);
         text-align: left;
+        white-space: nowrap;
     }}
     table.edr-table tbody td {{
         padding: 9px 14px;
@@ -454,6 +447,7 @@ st.markdown(f"""
         font-weight: 700;
         font-family: monospace;
         display: inline-block;
+        white-space: nowrap;
     }}
     .badge-danger {{
         background-color: {BADGE_DANGER_BG};
@@ -465,6 +459,7 @@ st.markdown(f"""
         font-weight: 700;
         font-family: monospace;
         display: inline-block;
+        white-space: nowrap;
     }}
     .badge-killed {{
         background-color: #0052cc;
@@ -475,6 +470,7 @@ st.markdown(f"""
         font-weight: 700;
         font-family: monospace;
         display: inline-block;
+        white-space: nowrap;
     }}
 </style>
 """, unsafe_allow_html=True)
@@ -570,20 +566,44 @@ def build_pdf_incident_report(df_alerts: pd.DataFrame) -> bytes:
     return bytes(pdf_out)
 
 
-# ---------------- TOP ENTERPRISE COMMAND BAR ---------------- #
-with top_bar_col1:
-    st.markdown(f"""
-    <div class="edr-navbar">
-        <div>
-            <div class="edr-brand-title">Behavior-Based Ransomware Detector (Mini-EDR)</div>
-            <div class="edr-brand-sub">Dawood University of Engineering & Technology (DUET) — Group F | Information Security Lab</div>
-        </div>
-        <div class="edr-nav-meta">
-            MODE: ENFORCING (ZERO-SIGNATURE)<br>
-            CONSOLE PID: {os.getpid()} | THEME: {st.session_state.ui_theme.upper()}
-        </div>
+# ---------------- HUMAN-FRIENDLY EVENT HELPERS ---------------- #
+def simplify_event_name(raw_type: str) -> str:
+    mapping = {
+        "CREATED": "File Created",
+        "MODIFIED": "File Modified",
+        "RENAMED": "File Renamed",
+        "DELETED": "File Deleted",
+        "TRAP_MODIFIED": "Trap File Modified",
+        "TRAP_RENAMED": "Trap File Renamed",
+        "TRAP_DELETED": "Trap File Deleted",
+        "VAULT_TAMPER": "Vault Tamper Blocked",
+    }
+    return mapping.get(str(raw_type), str(raw_type))
+
+
+def classify_event_risk(row) -> str:
+    ev = str(row["event_type"])
+    fname = str(row["file_path"]).lower()
+    if "TRAP" in ev or "VAULT" in ev or fname.endswith((".locked", ".enc", ".crypted", ".ransom", ".hacked")):
+        return "Attack Activity (Threat)"
+    if float(row.get("delta_entropy", 0.0)) >= 0.8 and float(row.get("new_entropy", 0.0)) >= 6.5:
+        return "Attack Activity (Threat)"
+    return "Normal Activity (Safe)"
+
+
+# ---------------- FULL-WIDTH TOP HEADER ---------------- #
+st.markdown(f"""
+<div class="edr-navbar">
+    <div>
+        <div class="edr-brand-title">Behavior-Based Ransomware Detector (Mini-EDR)</div>
+        <div class="edr-brand-sub">Dawood University of Engineering & Technology (DUET) — Group F | Information Security Lab</div>
     </div>
-    """, unsafe_allow_html=True)
+    <div class="edr-nav-meta">
+        MODE: ENFORCING &nbsp;|&nbsp; VAULT TAMPER GUARD: ACTIVE<br>
+        CONSOLE PID: {os.getpid()} &nbsp;|&nbsp; THEME: {st.session_state.ui_theme.upper()}
+    </div>
+</div>
+""", unsafe_allow_html=True)
 
 
 # ---------------- LIVE STATUS BANNER & KPI RIBBON ---------------- #
@@ -592,7 +612,19 @@ with top_bar_col1:
 def render_live_telemetry_header():
     alive, engine_pid, is_admin = get_engine_state()
     status = db.get_setting("system_status", "SECURE")
-    priv_badge = "<span class='badge-killed'>ADMIN (TIER-1 VSS ENABLED)</span>" if is_admin else "<span class='badge-clean'>STANDARD USER (TIER-2 VAULT)</span>"
+    t1_on = db.get_setting("tier1_vss_enabled", "1") == "1"
+    t2_on = db.get_setting("tier2_vault_enabled", "1") == "1"
+    folders = db.get_protected_folders()
+
+    if is_admin and t1_on:
+        active_tier_label = "TIER-1 VSS"
+        priv_badge = "<span class='badge-killed'>ADMIN | TIER-1 VSS ON</span>"
+    elif t2_on:
+        active_tier_label = "TIER-2 VAULT"
+        priv_badge = "<span class='badge-clean'>TIER-2 VAULT ACTIVE (VSS OFF)</span>" if is_admin else "<span class='badge-clean'>STANDARD | TIER-2 VAULT</span>"
+    else:
+        active_tier_label = "TIER-3 REPORT"
+        priv_badge = "<span class='badge-danger'>TIER-3 REPORT ONLY</span>"
 
     launching = float(db.get_setting("engine_launching_until", "0") or 0) > time.time()
 
@@ -603,7 +635,7 @@ def render_live_telemetry_header():
                 st.markdown(
                     '<div class="edr-banner-secure">'
                     '<div><span class="badge-clean">STARTING</span> &nbsp;&nbsp;'
-                    '<b>Sensor is initializing (vault backup / VSS snapshot). Please wait...</b></div>'
+                    '<b>Sensor is initializing protected folders & folder-mirrored backups. Please wait...</b></div>'
                     '</div>',
                     unsafe_allow_html=True
                 )
@@ -632,7 +664,7 @@ def render_live_telemetry_header():
                 st.markdown(
                     f'<div class="edr-banner-secure">'
                     f'<div><span class="badge-clean">NOMINAL</span> &nbsp;&nbsp;<b>ENDPOINT STATE: SECURE</b> &nbsp;|&nbsp; '
-                    f'Watchdog I/O, Entropy & Canary Inspection Online</div>'
+                    f'Monitoring {len(folders)} Folder(s) + Backup Vault Guard Active</div>'
                     f'<div class="mono-cell">PID: <b>{engine_pid}</b> &nbsp;|&nbsp; {priv_badge}</div>'
                     f'</div>',
                     unsafe_allow_html=True
@@ -645,7 +677,7 @@ def render_live_telemetry_header():
             st.markdown(
                 f'<div class="edr-banner-secure">'
                 f'<div><span class="badge-clean">NOMINAL</span> &nbsp;&nbsp;<b>ENDPOINT STATE: SECURE</b> &nbsp;|&nbsp; '
-                f'Watchdog I/O, Entropy, Canary Trap & Tier-1 Windows VSS Active</div>'
+                f'Monitoring {len(folders)} Folder(s) + Backup Vault Guard Active</div>'
                 f'<div class="mono-cell">PID: <b>{engine_pid}</b> &nbsp;|&nbsp; {priv_badge}</div>'
                 f'</div>',
                 unsafe_allow_html=True
@@ -655,7 +687,7 @@ def render_live_telemetry_header():
         with c_inc1:
             st.markdown(
                 f'<div class="edr-banner-alert">'
-                f'<div><span class="badge-danger">INCIDENT CONTAINED</span> &nbsp;&nbsp;<b>{status}</b></div>'
+                f'<div><span class="badge-danger">LIVE ALERT</span> &nbsp;&nbsp;<b>{status}</b></div>'
                 f'<div class="mono-cell">PID: <b>{engine_pid}</b> &nbsp;|&nbsp; {priv_badge}</div>'
                 f'</div>',
                 unsafe_allow_html=True
@@ -665,32 +697,30 @@ def render_live_telemetry_header():
                 db.set_setting("system_status", "SECURE")
                 st.rerun()
 
-    # Level 3: show files that could not be recovered by VSS or Vault
     unrec = db.get_setting("last_unrecovered", "")
     if unrec:
-        st.error(f"UNRECOVERED FILES — manual recovery required: {unrec}")
+        st.error(f"LEVEL 3 REPORT — Unrecovered files requiring manual recovery: {unrec}")
         if st.button("DISMISS UNRECOVERED LIST", key="dismiss_unrec"):
             db.set_setting("last_unrecovered", "")
             st.rerun()
 
-    monitored_cnt = db.get_setting("monitored_files_count", "12")
+    monitored_cnt = db.get_setting("monitored_files_count", "0")
     vault_kb = db.get_setting("vault_size_kb", "0.0")
     savings_pct = db.get_setting("vault_savings_pct", "0.0")
     cpu_pct = db.get_setting("engine_cpu", "0.0")
     ram_mb = db.get_setting("engine_ram_mb", "0.0")
-    vss_state = db.get_setting("vss_status", "Tier-2 Compressed Vault Active")
 
     st.markdown(f"""
     <div class="kpi-grid">
         <div class="kpi-card">
             <div class="kpi-title">Protected Assets</div>
             <div class="kpi-value">{monitored_cnt} Files</div>
-            <div class="kpi-sub">+25 Hidden Canary Traps (!000_Trap)</div>
+            <div class="kpi-sub">Across {len(folders)} Folder(s) + Canary Traps</div>
         </div>
         <div class="kpi-card">
-            <div class="kpi-title">Vault Storage Footprint</div>
+            <div class="kpi-title">Folder-Mirrored Vault</div>
             <div class="kpi-value">{vault_kb} KB</div>
-            <div class="kpi-sub">zlib DEFLATE Level-6 ({savings_pct}% Space Saved)</div>
+            <div class="kpi-sub">Read-Only + Monitored ({savings_pct}% Saved)</div>
         </div>
         <div class="kpi-card">
             <div class="kpi-title">Sensor CPU Overhead</div>
@@ -703,9 +733,9 @@ def render_live_telemetry_header():
             <div class="kpi-sub">Target Envelope: 60 - 100 MB</div>
         </div>
         <div class="kpi-card">
-            <div class="kpi-title">3-Tier Recovery Engine</div>
-            <div class="kpi-value">{"TIER-1 VSS" if is_admin else "TIER-2 VAULT"}</div>
-            <div class="kpi-sub">{vss_state}</div>
+            <div class="kpi-title">Active Recovery Tier</div>
+            <div class="kpi-value">{active_tier_label}</div>
+            <div class="kpi-sub">Toggle Tiers Anytime in Tab 04</div>
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -715,256 +745,260 @@ render_live_telemetry_header()
 
 # ---------------- NAVIGATION TABS ---------------- #
 tab_sandbox, tab_monitor, tab_alerts, tab_policy = st.tabs([
-    "01 | ADVERSARIAL SIMULATION SANDBOX (LIVE DEMO)",
-    "02 | LIVE SOC TELEMETRY & GRAPHS",
-    "03 | INCIDENT RESPONSE & RECOVERY AUDIT",
-    "04 | DETECTION POLICY, WHITELIST & VSS"
+    "01 | LIVE DEMO & SIMULATION PANEL",
+    "02 | LIVE MONITOR & SIMPLE GRAPHS",
+    "03 | THREAT ALERTS & RECOVERY LOGS",
+    "04 | FOLDERS, RECOVERY TIERS & SETTINGS"
 ])
 
 
 # ==============================================================================
-# TAB 1: ADVERSARIAL SIMULATION SANDBOX (LIVE DEMO)
+# TAB 1: LIVE DEMO & SIMULATION PANEL
 # ==============================================================================
 with tab_sandbox:
-    st.markdown('<div class="edr-section-hdr">Controlled Ransomware Emulation & Instant Recovery Verification</div>', unsafe_allow_html=True)
-    st.caption(
-        f"Isolated Sandbox Path: {DEMO_SANDBOX}  |  Canary Folder: {os.path.join(DEMO_SANDBOX, TRAP_FOLDER_NAME)}  |  "
-        f"All simulated attacks are strictly asserted to run only inside this directory."
-    )
+    st.markdown('<div class="edr-section-hdr">Controlled Ransomware Emulation (Safe Presentation Demo)</div>', unsafe_allow_html=True)
+
+    folders = db.get_protected_folders()
+    safe_demo_folders = [
+        f for f in folders
+        if os.path.normcase(f).startswith(os.path.normcase(BASE_DIR)) and os.path.isdir(f)
+    ]
+    if not safe_demo_folders:
+        safe_demo_folders = [DEMO_SANDBOX]
+
+    sel_col1, sel_col2 = st.columns([2, 3])
+    with sel_col1:
+        target_demo_folder = st.selectbox("Select Target Folder to Simulate Attack On:", safe_demo_folders)
+    with sel_col2:
+        hold_sec = float(db.get_setting("visual_hold_sec", "3.0") or 3.0)
+        st.caption(
+            f"The engine monitors ALL {len(folders)} folders plus MiniEDR_Backup_Vault. "
+            f"On attack, the ransomware is killed immediately and compromised files stay visible for {hold_sec:.0f}s before auto-restore."
+        )
 
     sim_c1, sim_c2, sim_c3, sim_c4, sim_c5, sim_c6 = st.columns(6)
 
     with sim_c1:
-        if st.button("LAUNCH FULL BURST ATTACK", type="primary", use_container_width=True):
-            subprocess.Popen([sys.executable, os.path.join(BASE_DIR, "fake_ransomware.py"), "normal"])
-            st.toast("Dispatched high-speed encryption burst (.locked).")
+        if st.button("FULL BURST ATTACK", type="primary", use_container_width=True):
+            subprocess.Popen([sys.executable, os.path.join(BASE_DIR, "fake_ransomware.py"), "normal", target_demo_folder])
+            st.toast(f"Full burst attack launched on {os.path.basename(target_demo_folder)}.")
 
     with sim_c2:
-        if st.button("TRIGGER CANARY HONEYPOT", use_container_width=True):
-            subprocess.Popen([sys.executable, os.path.join(BASE_DIR, "fake_ransomware.py"), "trap"])
-            st.toast("Dispatched !000_Trap canary modification workload.")
+        if st.button("CANARY TRAP PROBE", use_container_width=True):
+            subprocess.Popen([sys.executable, os.path.join(BASE_DIR, "fake_ransomware.py"), "trap", target_demo_folder])
+            st.toast("Canary (!000_Trap) probe launched.")
 
     with sim_c3:
-        if st.button("LAUNCH HEADER CORRUPTION", use_container_width=True):
-            subprocess.Popen([sys.executable, os.path.join(BASE_DIR, "fake_ransomware.py"), "partial"])
-            st.toast("Dispatched 4KB header corruption workload.")
+        if st.button("HEADER CORRUPTION", use_container_width=True):
+            subprocess.Popen([sys.executable, os.path.join(BASE_DIR, "fake_ransomware.py"), "partial", target_demo_folder])
+            st.toast("4KB header corruption attack launched.")
 
     with sim_c4:
-        if st.button("LAUNCH SLOW EVASION ATTACK", use_container_width=True):
-            subprocess.Popen([sys.executable, os.path.join(BASE_DIR, "fake_ransomware.py"), "slow"])
-            st.toast("Dispatched low-and-slow encryption workload.")
+        if st.button("TRAP-EVADING BURST", use_container_width=True):
+            subprocess.Popen([sys.executable, os.path.join(BASE_DIR, "fake_ransomware.py"), "notrap", target_demo_folder])
+            st.toast("Trap-evading attack launched (tests speed + entropy rules).")
 
     with sim_c5:
-        if st.button("LAUNCH TRAP-EVADING BURST", use_container_width=True):
-            subprocess.Popen([sys.executable, os.path.join(BASE_DIR, "fake_ransomware.py"), "notrap"])
-            st.toast("Dispatched burst that skips !000_Trap (entropy/speed detection demo).")
+        if st.button("TEST VAULT TAMPER", use_container_width=True):
+            subprocess.Popen([sys.executable, os.path.join(BASE_DIR, "fake_ransomware.py"), "vault"])
+            st.toast("Simulated attacker trying to corrupt MiniEDR_Backup_Vault!")
 
     with sim_c6:
-        if st.button("RE-INITIALIZE CLEAN SANDBOX", use_container_width=True):
+        if st.button("RESET DEMO SANDBOX", use_container_width=True):
             db.send_command("REINIT_SANDBOX")
-            st.toast("Dispatched sandbox & vault re-initialization command to sensor.")
+            st.toast("Sandbox reset command dispatched.")
 
     @st.fragment(run_every=1.5)
     @safe_render
     def render_sandbox_inventory():
         if db.get_setting("engine_busy", "0") == "1" and get_engine_state()[0]:
-            st.info("Sensor is creating vault backups / re-initializing the sandbox. Live inventory resumes automatically...")
+            st.info("Sensor is syncing backups. Live inventory resumes in a moment...")
             return
 
-        # Live Latest Blocked Attack Telemetry right inside the Demo Sandbox tab!
         df_latest = db.read_df("SELECT * FROM alerts ORDER BY id DESC LIMIT 1")
         if not df_latest.empty:
             r = df_latest.iloc[0]
             st.markdown(
                 f"<div class='edr-banner-alert'>"
-                f"<div><span class='badge-killed'>LATEST INTERCEPTED INCIDENT #{r['id']}</span> &nbsp;&nbsp;"
+                f"<div><span class='badge-killed'>LATEST BLOCKED ATTACK #{r['id']}</span> &nbsp;&nbsp;"
                 f"<b>Process:</b> <code>{r['process_name']} (PID: {r['pid']})</code> &rarr; <b>{str(r['disposition']).upper()}</b> &nbsp;|&nbsp; "
-                f"<b>Trigger:</b> {r['reason']}</div>"
+                f"<b>Reason:</b> {r['reason']}</div>"
                 f"<div class='mono-cell'><b>Recovery:</b> {r['recovery_method']} ({r['affected_files']} files) &nbsp;|&nbsp; "
                 f"<b>Detect:</b> {r['detection_time_ms']} ms &nbsp;|&nbsp; <b>Restore:</b> {r['restore_time_ms']} ms</div>"
                 f"</div>",
                 unsafe_allow_html=True
             )
 
+        vault_meta_map = db.get_all_vault_meta()
+
         col_inv1, col_inv2 = st.columns([3, 2])
 
         with col_inv1:
-            st.markdown('<div class="edr-section-hdr">Protected Sandbox Asset Inventory (Live Integrity State)</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="edr-section-hdr">Live Files in Selected Folder: {os.path.basename(target_demo_folder)}</div>', unsafe_allow_html=True)
             try:
-                sandbox_exists = os.path.exists(DEMO_SANDBOX)
-                sandbox_names = sorted(os.listdir(DEMO_SANDBOX)) if sandbox_exists else []
+                names = sorted(os.listdir(target_demo_folder)) if os.path.isdir(target_demo_folder) else []
             except OSError:
-                sandbox_exists, sandbox_names = False, []
+                names = []
 
-            if sandbox_exists:
-                asset_html = []
-                for fname in sandbox_names:
-                    fpath = os.path.join(DEMO_SANDBOX, fname)
-                    # Files can vanish mid-attack: guard every filesystem call
-                    try:
-                        if not os.path.isfile(fpath):
-                            continue
-                        ent = calculate_entropy(fpath)
-                        sz = os.path.getsize(fpath)
-                        sha = get_sha256(fpath)
-                    except OSError:
+            asset_html = []
+            for fname in names:
+                fpath = os.path.abspath(os.path.join(target_demo_folder, fname))
+                try:
+                    if not os.path.isfile(fpath):
                         continue
-                    is_comp = fname.endswith(".locked") or ent >= 7.2
-                    badge = "<span class='badge-danger'>COMPROMISED</span>" if is_comp else "<span class='badge-clean'>VERIFIED CLEAN</span>"
-                    asset_html.append(
-                        f"<tr>"
-                        f"<td>{badge}</td>"
-                        f"<td class='mono-cell'><b>{fname}</b></td>"
-                        f"<td class='mono-cell'>{sz:,} Bytes</td>"
-                        f"<td class='mono-cell'>{ent:.3f}</td>"
-                        f"<td class='mono-cell'>{sha[:28]}...</td>"
-                        f"</tr>"
-                    )
+                    ent = calculate_entropy(fpath)
+                    sz = os.path.getsize(fpath)
+                    sha = get_sha256(fpath)
+                    meta = vault_meta_map.get(fpath)
+                    clean_hash = meta[2] if meta else None
+                    is_comp = is_file_compromised(fpath, known_clean_hash=clean_hash)
+                except OSError:
+                    continue
+                badge = "<span class='badge-danger'>COMPROMISED</span>" if is_comp else "<span class='badge-clean'>SAFE</span>"
+                asset_html.append(
+                    f"<tr>"
+                    f"<td>{badge}</td>"
+                    f"<td class='mono-cell'><b>{fname}</b></td>"
+                    f"<td class='mono-cell'>{sz:,} B</td>"
+                    f"<td class='mono-cell'>{ent:.2f}</td>"
+                    f"<td class='mono-cell'>{sha[:20]}...</td>"
+                    f"</tr>"
+                )
+            if asset_html:
                 st.markdown(
                     "<div class='edr-table-wrap'><table class='edr-table'>"
-                    "<thead><tr><th>Integrity Status</th><th>Full Asset Name</th><th>Size</th><th>Entropy</th><th>SHA-256 Digest</th></tr></thead>"
+                    "<thead><tr><th>Status</th><th>File Name</th><th>Size</th><th>Entropy</th><th>SHA-256 Hash</th></tr></thead>"
                     f"<tbody>{''.join(asset_html)}</tbody></table></div>",
                     unsafe_allow_html=True
                 )
+            else:
+                st.info("This folder has no files yet. Add any .docx, .pdf, .txt, or .jpg file and the engine will back it up automatically.")
 
         with col_inv2:
-            st.markdown('<div class="edr-section-hdr">Tier-2 Compressed Backup Vault (.zvault) Audit</div>', unsafe_allow_html=True)
-            try:
-                vault_exists = os.path.exists(VAULT_DIR)
-                vault_names = sorted(os.listdir(VAULT_DIR)) if vault_exists else []
-            except OSError:
-                vault_exists, vault_names = False, []
-
-            if vault_exists:
+            st.markdown('<div class="edr-section-hdr">Folder-Mirrored Backup Vault Structure</div>', unsafe_allow_html=True)
+            df_vault = db.read_df("SELECT file_path, orig_size, comp_size FROM vault_metadata ORDER BY file_path ASC")
+            if not df_vault.empty:
                 vault_html = []
-                for vname in vault_names:
-                    vpath = os.path.join(VAULT_DIR, vname)
-                    try:
-                        if not os.path.isfile(vpath):
-                            continue
-                        orig_name = vname.replace(".zvault", "")
-                        orig_path = os.path.join(DEMO_SANDBOX, orig_name)
-                        orig_sz = os.path.getsize(orig_path) if os.path.exists(orig_path) else 0
-                        comp_sz = os.path.getsize(vpath)
-                    except OSError:
-                        continue
-                    saving_pct = round((1.0 - (comp_sz / orig_sz)) * 100, 1) if orig_sz > 0 else 0.0
+                for _, vr in df_vault.iterrows():
+                    fp = str(vr["file_path"])
+                    folder_lbl = os.path.basename(os.path.dirname(fp))
+                    file_lbl = os.path.basename(fp)
+                    orig_sz = int(vr["orig_size"] or 0)
+                    comp_sz = int(vr["comp_size"] or 0)
+                    saving = round((1.0 - (comp_sz / orig_sz)) * 100, 1) if orig_sz > 0 else 0.0
                     vault_html.append(
                         f"<tr>"
-                        f"<td class='mono-cell'><b>{vname}</b></td>"
+                        f"<td class='mono-cell'><span class='badge-clean'>{folder_lbl}</span> / <b>{file_lbl}</b></td>"
                         f"<td class='mono-cell'>{orig_sz:,} B</td>"
                         f"<td class='mono-cell'>{comp_sz:,} B</td>"
-                        f"<td><span class='badge-clean'>-{saving_pct}%</span></td>"
+                        f"<td><span class='badge-clean'>-{saving}%</span></td>"
                         f"</tr>"
                     )
                 st.markdown(
                     "<div class='edr-table-wrap'><table class='edr-table'>"
-                    "<thead><tr><th>Vault Object Name</th><th>Raw Size</th><th>Compressed</th><th>Saved</th></tr></thead>"
+                    "<thead><tr><th>Vault Folder / File</th><th>Original</th><th>Vault</th><th>Saved</th></tr></thead>"
                     f"<tbody>{''.join(vault_html)}</tbody></table></div>",
                     unsafe_allow_html=True
                 )
+            else:
+                st.info("No files backed up in vault yet.")
 
     render_sandbox_inventory()
 
 
 # ==============================================================================
-# TAB 2: LIVE SOC TELEMETRY & GRAPHS
+# TAB 2: LIVE MONITOR & SIMPLE GRAPHS (CLEAN, UNCLUTTERED, BEGINNER-FRIENDLY)
 # ==============================================================================
 with tab_monitor:
-    @st.fragment(run_every=2)
+    @st.fragment(run_every=2.0)
     @safe_render
     def render_soc_monitor():
-        df_events = db.read_df("SELECT * FROM file_events ORDER BY id DESC LIMIT 50")
+        df_events = db.read_df("SELECT * FROM file_events ORDER BY id DESC LIMIT 40")
 
         if not df_events.empty:
             df_chron = df_events.iloc[::-1].copy()
-            df_chron["seq_label"] = "#" + df_chron["id"].astype(str) + " " + df_chron["file_path"]
             df_chron["time_sec"] = df_chron["timestamp"].str.slice(0, 8)
+            df_chron["Activity_Category"] = df_chron.apply(classify_event_risk, axis=1)
 
             col_chart1, col_chart2 = st.columns(2)
 
+            # CHART 1: Simple Last 12 Active Timestamps (Blue = Safe, Red = Threat)
             with col_chart1:
-                st.markdown('<div class="edr-section-hdr">File System Activity Over Time (I/O Operations / Second)</div>', unsafe_allow_html=True)
-                df_rate = (
-                    df_chron.groupby(["time_sec", "event_type"])
+                st.markdown('<div class="edr-section-hdr">Chart 1: Recent File Activity (Blue = Safe | Red = Attack)</div>', unsafe_allow_html=True)
+                recent_times = df_chron["time_sec"].drop_duplicates().tail(12)
+                df_c1 = df_chron[df_chron["time_sec"].isin(recent_times)]
+                df_simple = (
+                    df_c1.groupby(["time_sec", "Activity_Category"])
                     .size()
-                    .reset_index(name="event_count")
+                    .reset_index(name="Files_Touched")
                 )
                 fig_activity = px.bar(
-                    df_rate,
+                    df_simple,
                     x="time_sec",
-                    y="event_count",
-                    color="event_type",
-                    barmode="stack",
+                    y="Files_Touched",
+                    color="Activity_Category",
+                    barmode="group",
                     template=PLOTLY_TEMPLATE,
                     color_discrete_map={
-                        "MODIFIED": "#0052cc",
-                        "RENAMED": "#d97706",
-                        "CREATED": "#0284c7",
-                        "DELETED": "#dc2626",
-                        "TRAP_MODIFIED": "#991b1b",
-                        "TRAP_RENAMED": "#991b1b",
-                        "TRAP_DELETED": "#991b1b"
+                        "Normal Activity (Safe)": "#0284c7",
+                        "Attack Activity (Threat)": "#dc2626",
+                    },
+                    labels={
+                        "time_sec": "Time (HH:MM:SS)",
+                        "Files_Touched": "Files Changed",
+                        "Activity_Category": "Status"
                     }
                 )
                 fig_activity.update_layout(
                     paper_bgcolor=BG_CARD,
                     plot_bgcolor=BG_CARD,
                     font=dict(color=TEXT_PRIMARY, size=11),
-                    height=340,
-                    margin=dict(l=15, r=15, t=25, b=40),
-                    xaxis=dict(
-                        title=dict(text="Timestamp (HH:MM:SS)", font=dict(color=TEXT_PRIMARY)),
-                        tickfont=dict(color=TEXT_SECONDARY),
-                        gridcolor=BORDER_COLOR,
-                        linecolor=BORDER_COLOR
-                    ),
-                    yaxis=dict(
-                        title=dict(text="Events / Second", font=dict(color=TEXT_PRIMARY)),
-                        tickfont=dict(color=TEXT_SECONDARY),
-                        gridcolor=BORDER_COLOR,
-                        linecolor=BORDER_COLOR
-                    ),
-                    legend=dict(
-                        orientation="h",
-                        y=1.14,
-                        x=0,
-                        title=None,
-                        font=dict(color=TEXT_PRIMARY)
-                    )
+                    height=350,
+                    margin=dict(l=20, r=20, t=48, b=50),
+                    xaxis=dict(title="Time (HH:MM:SS)", tickfont=dict(color=TEXT_SECONDARY), gridcolor=BORDER_COLOR, tickangle=-25),
+                    yaxis=dict(title="Files Changed", tickfont=dict(color=TEXT_SECONDARY), gridcolor=BORDER_COLOR, dtick=1),
+                    legend=dict(orientation="h", y=1.15, x=0, title=None, font=dict(color=TEXT_PRIMARY))
                 )
                 st.plotly_chart(fig_activity, use_container_width=True, theme=None)
 
+            # CHART 2: Last 15 Events Entropy Comparison (Clean #ID on X-axis, Full File Name on Hover)
             with col_chart2:
-                st.markdown('<div class="edr-section-hdr">Shannon Entropy Differential (Baseline vs. Post-Event)</div>', unsafe_allow_html=True)
+                st.markdown('<div class="edr-section-hdr">Chart 2: File Randomness / Entropy (Last 15 Events — Hover for File Name)</div>', unsafe_allow_html=True)
+                df_c2 = df_chron.tail(15).copy()
+                df_c2["short_id"] = "#" + df_c2["id"].astype(str)
+
                 fig_entropy = go.Figure()
                 fig_entropy.add_trace(go.Scatter(
-                    x=df_chron["seq_label"],
-                    y=df_chron["old_entropy"],
-                    name="Baseline Entropy (Clean)",
+                    x=df_c2["short_id"],
+                    y=df_c2["old_entropy"],
+                    customdata=df_c2["file_path"],
+                    name="Before (Clean File)",
                     mode="lines+markers",
-                    line=dict(color="#0284c7", width=2.2, shape="spline"),
-                    marker=dict(size=5, color="#0284c7"),
+                    line=dict(color="#0284c7", width=2.5, shape="spline"),
+                    marker=dict(size=7, color="#0284c7"),
                     fill="tozeroy",
-                    fillcolor="rgba(2, 132, 199, 0.10)"
+                    fillcolor="rgba(2, 132, 199, 0.10)",
+                    hovertemplate="<b>%{customdata}</b><br>Event: %{x}<br>Before Entropy: %{y:.2f}<extra></extra>"
                 ))
                 fig_entropy.add_trace(go.Scatter(
-                    x=df_chron["seq_label"],
-                    y=df_chron["new_entropy"],
-                    name="Observed Entropy (Post-Event)",
+                    x=df_c2["short_id"],
+                    y=df_c2["new_entropy"],
+                    customdata=df_c2["file_path"],
+                    name="After (Modified File)",
                     mode="lines+markers",
-                    line=dict(color="#dc2626", width=2.5, shape="spline"),
-                    marker=dict(size=6, color="#dc2626"),
+                    line=dict(color="#dc2626", width=2.8, shape="spline"),
+                    marker=dict(size=8, color="#dc2626"),
                     fill="tonexty",
-                    fillcolor="rgba(220, 38, 38, 0.16)"
+                    fillcolor="rgba(220, 38, 38, 0.16)",
+                    hovertemplate="<b>%{customdata}</b><br>Event: %{x}<br>After Entropy: %{y:.2f}<extra></extra>"
                 ))
                 high_ent_limit = float(db.get_setting("absolute_high_entropy", 7.2))
                 fig_entropy.add_hline(
                     y=high_ent_limit,
                     line_dash="dash",
                     line_color="#d97706",
-                    annotation_text=f"HIGH ENTROPY LIMIT ({high_ent_limit:.2f} bits/byte)",
-                    annotation_position="top left",
+                    annotation_text=f"Text Encryption Limit ({high_ent_limit:.2f})",
+                    annotation_position="bottom right",
                     annotation_font=dict(size=10, color="#d97706")
                 )
                 fig_entropy.update_layout(
@@ -972,76 +1006,58 @@ with tab_monitor:
                     paper_bgcolor=BG_CARD,
                     plot_bgcolor=BG_CARD,
                     font=dict(color=TEXT_PRIMARY, size=11),
-                    height=340,
-                    margin=dict(l=15, r=15, t=25, b=65),
-                    xaxis=dict(
-                        title=dict(text="File Event Sequence", font=dict(color=TEXT_PRIMARY)),
-                        tickfont=dict(color=TEXT_SECONDARY, size=10),
-                        gridcolor=BORDER_COLOR,
-                        linecolor=BORDER_COLOR,
-                        tickangle=-25
-                    ),
-                    yaxis=dict(
-                        range=[0, 8.4],
-                        title=dict(text="Shannon Entropy (0.0 - 8.0)", font=dict(color=TEXT_PRIMARY)),
-                        tickfont=dict(color=TEXT_SECONDARY),
-                        gridcolor=BORDER_COLOR,
-                        linecolor=BORDER_COLOR
-                    ),
-                    legend=dict(
-                        orientation="h",
-                        y=1.14,
-                        x=0,
-                        font=dict(color=TEXT_PRIMARY)
-                    )
+                    height=350,
+                    margin=dict(l=20, r=20, t=48, b=50),
+                    xaxis=dict(title="Event ID (Hover Dot for File Name)", tickfont=dict(color=TEXT_SECONDARY, size=11), gridcolor=BORDER_COLOR),
+                    yaxis=dict(range=[0, 8.6], title="Shannon Entropy (0 - 8)", tickfont=dict(color=TEXT_SECONDARY), gridcolor=BORDER_COLOR),
+                    legend=dict(orientation="h", y=1.15, x=0, font=dict(color=TEXT_PRIMARY))
                 )
                 st.plotly_chart(fig_entropy, use_container_width=True, theme=None)
 
             c_hdr1, c_hdr2 = st.columns([5, 1])
             with c_hdr1:
-                st.markdown('<div class="edr-section-hdr">Real-Time Watchdog I/O Telemetry Stream</div>', unsafe_allow_html=True)
+                st.markdown('<div class="edr-section-hdr">Recent File Activity Log (Simplified View)</div>', unsafe_allow_html=True)
             with c_hdr2:
-                if st.button("CLEAR TELEMETRY", use_container_width=True):
+                if st.button("CLEAR LOG", use_container_width=True):
                     db.execute_write("DELETE FROM file_events")
                     st.rerun()
 
             rows_html = []
-            for _, r in df_events.head(30).iterrows():
-                ev_type = str(r["event_type"])
-                badge_cls = "badge-danger" if ("TRAP" in ev_type or r["new_entropy"] >= 7.2) else "badge-clean"
+            for _, r in df_events.head(25).iterrows():
+                is_threat = classify_event_risk(r).startswith("Attack")
+                risk_badge = "<span class='badge-danger'>THREAT</span>" if is_threat else "<span class='badge-clean'>SAFE</span>"
+                action_text = simplify_event_name(r["event_type"])
                 rows_html.append(
                     f"<tr>"
                     f"<td class='mono-cell'>#{r['id']}</td>"
                     f"<td class='mono-cell'>{r['timestamp']}</td>"
-                    f"<td><span class='{badge_cls}'>{ev_type}</span></td>"
-                    f"<td class='mono-cell'><b>{r['file_path']}</b></td>"
-                    f"<td class='mono-cell'>{r['old_entropy']:.3f}</td>"
-                    f"<td class='mono-cell'><b>{r['new_entropy']:.3f}</b></td>"
-                    f"<td class='mono-cell'>+{r['delta_entropy']:.3f}</td>"
+                    f"<td>{risk_badge}</td>"
+                    f"<td><b>{action_text}</b></td>"
+                    f"<td class='mono-cell'>{r['file_path']}</td>"
+                    f"<td class='mono-cell'>{r['old_entropy']:.2f} &rarr; <b>{r['new_entropy']:.2f}</b></td>"
                     f"</tr>"
                 )
             st.markdown(
                 "<div class='edr-table-wrap'><table class='edr-table'>"
-                "<thead><tr><th>Event ID</th><th>Timestamp</th><th>Operation</th><th>Target Asset Name</th>"
-                "<th>Baseline Entropy</th><th>Observed Entropy</th><th>Entropy Delta</th></tr></thead>"
+                "<thead><tr><th>ID</th><th>Time</th><th>Risk Level</th><th>Action</th><th>File Name</th><th>Entropy (Before &rarr; After)</th></tr></thead>"
                 f"<tbody>{''.join(rows_html)}</tbody></table></div>",
                 unsafe_allow_html=True
             )
         else:
-            st.markdown('<div class="edr-section-hdr">Real-Time Watchdog I/O Telemetry Stream</div>', unsafe_allow_html=True)
-            st.info("No file system operations recorded yet. Use Tab 01 to launch a simulated attack.")
+            st.markdown('<div class="edr-section-hdr">Recent File Activity Log</div>', unsafe_allow_html=True)
+            st.info("No file activity recorded yet. Use Tab 01 to run a simulated attack or add files to a protected folder.")
 
     render_soc_monitor()
 
 
 # ==============================================================================
-# TAB 3: INCIDENT RESPONSE & RECOVERY AUDIT
+# TAB 3: THREAT ALERTS & RECOVERY LOGS
 # ==============================================================================
 with tab_alerts:
-    @st.fragment(run_every=2)
+    @st.fragment(run_every=2.0)
     @safe_render
     def render_incident_history():
-        st.markdown('<div class="edr-section-hdr">Contained Ransomware Incidents & Three-Tier Recovery Audit Log</div>', unsafe_allow_html=True)
+        st.markdown('<div class="edr-section-hdr">Blocked Ransomware Attacks & Automated Recovery History</div>', unsafe_allow_html=True)
         df_alerts = db.read_df("SELECT * FROM alerts ORDER BY id DESC")
 
         if not df_alerts.empty:
@@ -1063,8 +1079,8 @@ with tab_alerts:
                 )
             st.markdown(
                 "<div class='edr-table-wrap'><table class='edr-table'>"
-                "<thead><tr><th>ID</th><th>Timestamp</th><th>Process & PID</th><th>Disposition</th>"
-                "<th>Behavioral Trigger Heuristic</th><th>Assets</th><th>Recovery Tier & Result</th><th>Detect / Restore SLA</th></tr></thead>"
+                "<thead><tr><th>ID</th><th>Timestamp</th><th>Process & PID</th><th>Action</th>"
+                "<th>Detection Reason</th><th>Files</th><th>Recovery Result</th><th>Detect / Restore</th></tr></thead>"
                 f"<tbody>{''.join(inc_rows)}</tbody></table></div>",
                 unsafe_allow_html=True
             )
@@ -1073,7 +1089,7 @@ with tab_alerts:
             with exp_c1:
                 csv_bytes = df_alerts.to_csv(index=False).encode("utf-8")
                 st.download_button(
-                    label="DOWNLOAD AUDIT LOG (CSV)",
+                    label="EXPORT REPORT (CSV)",
                     data=csv_bytes,
                     file_name="mini_edr_incident_report.csv",
                     mime="text/csv",
@@ -1082,93 +1098,176 @@ with tab_alerts:
             with exp_c2:
                 pdf_bytes = build_pdf_incident_report(df_alerts)
                 st.download_button(
-                    label="DOWNLOAD EXECUTIVE REPORT (PDF)",
+                    label="EXPORT REPORT (PDF)",
                     data=pdf_bytes,
                     file_name="mini_edr_incident_report.pdf",
                     mime="application/pdf",
                     use_container_width=True
                 )
             with exp_c3:
-                if st.button("PURGE INCIDENT LOGS", use_container_width=True):
+                if st.button("CLEAR HISTORY", use_container_width=True):
                     db.execute_write("DELETE FROM alerts")
                     db.set_setting("system_status", "SECURE")
                     st.rerun()
         else:
-            st.info("Zero ransomware incidents recorded. All monitored assets match their clean SHA-256 baseline hashes.")
+            st.info("No ransomware attacks recorded yet.")
 
     render_incident_history()
 
 
 # ==============================================================================
-# TAB 4: DETECTION POLICY, WHITELIST & VSS DIAGNOSTICS
+# TAB 4: PROTECTED FOLDERS, RECOVERY TIERS, SETTINGS & WHITELIST
 # ==============================================================================
 with tab_policy:
     col_pol1, col_pol2 = st.columns(2)
 
     with col_pol1:
-        st.markdown('<div class="edr-section-hdr">Behavioral Heuristic Detection Parameters</div>', unsafe_allow_html=True)
+        st.markdown('<div class="edr-section-hdr">Protected Folders (Mirrored Inside Backup Vault)</div>', unsafe_allow_html=True)
+        st.caption("Add any folder containing existing .docx, .pdf, .xlsx, .jpg files. Each folder gets its own subfolder inside MiniEDR_Backup_Vault.")
+
+        new_folder_input = st.text_input(
+            "Folder Path to Protect",
+            placeholder=r"C:\IS_project\Folder_2"
+        )
+        if st.button("ADD PROTECTED FOLDER", use_container_width=True, type="primary"):
+            cleaned_dir = os.path.abspath(new_folder_input.strip().strip('"'))
+            if not new_folder_input.strip():
+                st.error("Enter a folder path first.")
+            elif os.path.normcase(cleaned_dir) == os.path.normcase(VAULT_DIR):
+                st.error("Backup Vault is already monitored by the Vault Tamper Guard.")
+            elif os.path.isdir(cleaned_dir):
+                cur_folders = db.get_protected_folders()
+                if os.path.normcase(cleaned_dir) not in [os.path.normcase(x) for x in cur_folders]:
+                    cur_folders.append(cleaned_dir)
+                    db.set_protected_folders(cur_folders)
+                    db.send_command("RELOAD_WATCHES")
+                    st.success(f"Added '{cleaned_dir}'. Engine is backing it up into MiniEDR_Backup_Vault\\{os.path.basename(cleaned_dir)}\\")
+                    st.rerun()
+                else:
+                    st.info("This folder is already protected.")
+            else:
+                st.error("Folder does not exist on disk. Create it first or check the path.")
+
+        monitored_folders = db.get_protected_folders()
+        f_rows = []
+        for idx, fpath in enumerate(monitored_folders, start=1):
+            exists = os.path.isdir(fpath)
+            f_badge = "<span class='badge-clean'>MONITORING</span>" if exists else "<span class='badge-danger'>NOT FOUND</span>"
+            f_rows.append(
+                f"<tr>"
+                f"<td class='mono-cell'>#{idx}</td>"
+                f"<td class='mono-cell'><b>{fpath}</b></td>"
+                f"<td>{f_badge}</td>"
+                f"</tr>"
+            )
+        st.markdown(
+            "<div class='edr-table-wrap'><table class='edr-table'>"
+            "<thead><tr><th>#</th><th>Protected Folder Path</th><th>State</th></tr></thead>"
+            f"<tbody>{''.join(f_rows)}</tbody></table></div>",
+            unsafe_allow_html=True
+        )
+
+        if len(monitored_folders) > 1:
+            rem_col1, rem_col2 = st.columns([3, 1])
+            with rem_col1:
+                folder_to_remove = st.selectbox("Select Folder to Stop Monitoring", monitored_folders)
+            with rem_col2:
+                st.write("")
+                if st.button("REMOVE", use_container_width=True):
+                    updated = [f for f in monitored_folders if f != folder_to_remove]
+                    db.set_protected_folders(updated)
+                    db.send_command("RELOAD_WATCHES")
+                    st.rerun()
+
+        st.divider()
+
+        st.markdown('<div class="edr-section-hdr">3-Tier Recovery Switches & Console Theme</div>', unsafe_allow_html=True)
+        st.caption("Turn Tier-1 VSS OFF to demonstrate Tier-2 Folder Vault recovery. Turn both OFF to demonstrate Tier-3 Contain & Report.")
+
+        t1_val = db.get_setting("tier1_vss_enabled", "1") == "1"
+        t2_val = db.get_setting("tier2_vault_enabled", "1") == "1"
+
+        new_t1 = st.checkbox("Enable Tier-1: Windows Volume Shadow Copy (VSS)", value=t1_val)
+        new_t2 = st.checkbox("Enable Tier-2: Folder-Mirrored Backup Vault (.zvault)", value=t2_val)
+
+        if new_t1 != t1_val or new_t2 != t2_val:
+            db.set_settings_batch({
+                "tier1_vss_enabled": "1" if new_t1 else "0",
+                "tier2_vault_enabled": "1" if new_t2 else "0",
+            })
+            st.success("Recovery tier configuration updated live!")
+            st.rerun()
+
+        chosen_theme = st.selectbox(
+            "Console Color Theme",
+            ["Blue & White (Light)", "Cyber Navy (Dark)"],
+            index=0 if st.session_state.ui_theme == "Blue & White (Light)" else 1
+        )
+        if chosen_theme != st.session_state.ui_theme:
+            st.session_state.ui_theme = chosen_theme
+            st.rerun()
+
+        if db.get_setting("engine_is_admin", "0") != "1":
+            if st.button("ELEVATE SENSOR AS ADMIN (ACTIVATE TIER-1 VSS)", use_container_width=True, type="primary"):
+                start_background_engine(as_admin=True)
+                st.rerun()
+
+    with col_pol2:
+        st.markdown('<div class="edr-section-hdr">Detection Thresholds & Live Demo Timing</div>', unsafe_allow_html=True)
         with st.form("heuristic_policy_form"):
             speed_files = st.number_input(
-                "Speed Check: Max Unique Modified Files in Sliding Window (Proposal: 4 - 15)",
+                "Max Modified Files in Time Window (Speed Check)",
                 value=int(db.get_setting("speed_limit_files", 4)),
                 min_value=2,
                 max_value=50
             )
             speed_win = st.number_input(
-                "Speed Check: Sliding Window Duration (Seconds)",
+                "Time Window (Seconds)",
                 value=int(db.get_setting("speed_window_sec", 5)),
                 min_value=1,
                 max_value=60
             )
             ent_delta = st.slider(
-                "Entropy Check: Minimum Shannon Entropy Jump (Delta Threshold)",
+                "Minimum Entropy Jump (Delta Threshold)",
                 min_value=0.1,
                 max_value=4.0,
                 value=float(db.get_setting("entropy_delta_threshold", 0.8)),
                 step=0.1
             )
             abs_ent = st.slider(
-                "Entropy Check: Absolute High Entropy Threshold (bits/byte)",
+                "High Entropy Threshold for Text Files (0.0 - 8.0)",
                 min_value=6.0,
                 max_value=7.95,
                 value=float(db.get_setting("absolute_high_entropy", 7.2)),
                 step=0.05
             )
-            if st.form_submit_button("UPDATE DETECTION POLICY", use_container_width=True):
+            visual_hold = st.slider(
+                "Demo Visual Pause After Process Kill (Seconds Before Auto-Restore)",
+                min_value=0.0,
+                max_value=6.0,
+                value=float(db.get_setting("visual_hold_sec", "3.0")),
+                step=0.5
+            )
+            if st.form_submit_button("SAVE DETECTION SETTINGS", use_container_width=True):
                 db.set_settings_batch({
                     "speed_limit_files": speed_files,
                     "speed_window_sec": speed_win,
                     "entropy_delta_threshold": ent_delta,
-                    "absolute_high_entropy": abs_ent
+                    "absolute_high_entropy": abs_ent,
+                    "visual_hold_sec": visual_hold
                 })
-                st.success("Heuristic policy updated and synchronized with background sensor.")
+                st.success("Detection & demo settings updated.")
 
-        st.markdown('<div class="edr-section-hdr">Tier-1 Recovery: Windows Volume Shadow Copy (VSS) Diagnostic</div>', unsafe_allow_html=True)
-        st.code(
-            f"Sensor Admin Mode : {'ENABLED (Administrator)' if db.get_setting('engine_is_admin') == '1' else 'DISABLED (Standard User)'}\n"
-            f"Subsystem Status  : {db.get_setting('vss_status', 'Standby')}\n"
-            f"Last Self-Test    : {db.get_setting('vss_last_test', 'Not Executed')}",
-            language="text"
-        )
-        vss_b1, vss_b2 = st.columns(2)
-        with vss_b1:
-            if st.button("ELEVATE SENSOR AS ADMIN (ENABLE VSS)", use_container_width=True, type="primary"):
-                start_background_engine(as_admin=True)
-                st.rerun()
-        with vss_b2:
-            if st.button("RUN WMI SHADOW COPY DIAGNOSTIC", use_container_width=True):
-                db.send_command("VSS_SELF_TEST")
-                st.toast("Dispatched VSS self-test command to background engine.")
+        st.divider()
 
-    with col_pol2:
-        st.markdown('<div class="edr-section-hdr">False Positive Prevention: SHA-256 & Authenticode Whitelist</div>', unsafe_allow_html=True)
+        st.markdown('<div class="edr-section-hdr">Trusted Program Whitelist (SHA-256 + Digital Signature)</div>', unsafe_allow_html=True)
         exe_input = st.text_input(
-            "Authorized Executable Path (.exe)",
+            "Trusted Program Path (.exe)",
             placeholder="C:\\Program Files\\WinRAR\\WinRAR.exe"
         )
         req_sig = st.checkbox("Require Valid Microsoft Authenticode Digital Signature", value=True)
 
-        if st.button("AUTHORIZE BINARY IN WHITELIST", use_container_width=True, type="primary"):
+        if st.button("ADD PROGRAM TO WHITELIST", use_container_width=True, type="primary"):
             cleaned_path = exe_input.strip().strip('"')
             base_exe = os.path.basename(cleaned_path).lower()
             blocked_interpreters = {"python.exe", "pythonw.exe", "cmd.exe", "powershell.exe", "pwsh.exe", "wscript.exe", "cscript.exe"}
@@ -1181,9 +1280,9 @@ with tab_policy:
                     "INSERT OR REPLACE INTO whitelist (process_name, exe_path, sha256_hash, require_signature) VALUES (?, ?, ?, ?)",
                     (os.path.basename(cleaned_path), cleaned_path, exe_hash, 1 if req_sig else 0)
                 )
-                st.success(f"Whitelisted '{os.path.basename(cleaned_path)}' | SHA-256: {exe_hash}")
+                st.success(f"Whitelisted '{os.path.basename(cleaned_path)}' | SHA-256: {exe_hash[:24]}...")
             else:
-                st.error("Specify an existing local .exe binary path.")
+                st.error("Specify an existing local .exe file path.")
 
         df_wl = db.read_df(
             "SELECT id, process_name, exe_path, sha256_hash, require_signature FROM whitelist ORDER BY id DESC"
@@ -1196,34 +1295,27 @@ with tab_policy:
                     f"<tr>"
                     f"<td class='mono-cell'>#{w['id']}</td>"
                     f"<td class='mono-cell'><b>{w['process_name']}</b></td>"
-                    f"<td class='mono-cell'>{w['exe_path']}</td>"
-                    f"<td class='mono-cell'>{w['sha256_hash']}</td>"
+                    f"<td class='mono-cell'>{str(w['sha256_hash'])[:22]}...</td>"
                     f"<td>{sig_badge}</td>"
                     f"</tr>"
                 )
             st.markdown(
                 "<div class='edr-table-wrap'><table class='edr-table'>"
-                "<thead><tr><th>ID</th><th>Binary Name</th><th>Full Executable Path</th><th>Full SHA-256 Hash</th><th>Authenticode Policy</th></tr></thead>"
+                "<thead><tr><th>ID</th><th>Program</th><th>SHA-256 Hash</th><th>Signature</th></tr></thead>"
                 f"<tbody>{''.join(wl_rows)}</tbody></table></div>",
                 unsafe_allow_html=True
             )
 
             c_del1, c_del2 = st.columns([3, 1])
             with c_del1:
-                del_id = st.selectbox("Select Whitelist ID to Revoke", df_wl["id"].tolist())
+                del_id = st.selectbox("Select Whitelist ID to Remove", df_wl["id"].tolist())
             with c_del2:
                 st.write("")
                 if st.button("REVOKE", use_container_width=True):
                     db.execute_write("DELETE FROM whitelist WHERE id=?", (int(del_id),))
                     st.rerun()
         else:
-            st.info("No external binaries whitelisted yet.")
-
-    st.markdown('<div class="edr-section-hdr">Sensor Diagnostic Telemetry Log (engine.log)</div>', unsafe_allow_html=True)
-    if os.path.exists(LOG_FILE):
-        try:
-            with open(LOG_FILE, "r", encoding="utf-8", errors="ignore") as lf:
-                log_lines = lf.readlines()[-20:]
-            st.code("".join(log_lines) if log_lines else "Sensor log initialized. Zero runtime errors.", language="text")
-        except Exception:
-            st.code("Unable to read engine.log", language="text")
+            st.info("No trusted programs whitelisted yet.")
+        last_wl = db.get_setting("last_whitelist_event", "")
+        if last_wl:
+            st.success(last_wl)
